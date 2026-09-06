@@ -3826,6 +3826,17 @@ def fmt_dt(value):
     except Exception:
         return safe_text(value)
 
+def fmt_dt_short(value):
+    if not value:
+        return "—"
+    try:
+        d = datetime.fromisoformat(value)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(TZ).strftime("%d/%m %H:%M")
+    except Exception:
+        return safe_text(value)
+
 def render_page(days):
     days = days if days in (1, 7, 30) else 1
 
@@ -3849,6 +3860,19 @@ def render_page(days):
                 r["key"]: r["value"]
                 for r in conn.execute("SELECT * FROM meta")
             }
+            
+            last_update_row = conn.execute("""
+                SELECT detected_at
+                FROM events
+                ORDER BY detected_at DESC
+                LIMIT 1
+            """).fetchone()
+
+            last_update = (
+                fmt_dt_short(last_update_row["detected_at"])
+                if last_update_row else "—"
+            )
+            
             lang = normalize_ui_language(meta.get("ui_language", "fr"))
 
             pending = conn.execute("""
@@ -4473,7 +4497,6 @@ def render_page(days):
 
     interval = safe_text(scan_status.get("interval_minutes", scan_settings.get("interval_minutes", 15)))
     duration = safe_text(meta.get("last_sync_duration_seconds", "—"))
-    retention = safe_text(meta.get("retention_days", HISTORY_RETENTION_DAYS))
     confirm_scans = safe_text(
         meta.get(
             "deletion_confirmation_scans",
@@ -5277,8 +5300,8 @@ code {{
             <div class="quick-value">{html.escape(duration)} s</div>
         </div>
         <div class="quick">
-            <div class="quick-label">{L("Rétention", "Retention")}</div>
-            <div class="quick-value">{html.escape(retention)} {L("jours", "days")}</div>
+            <div class="quick-label">{L("Dernière mise à jour", "Last update")}</div>
+            <div class="quick-value">{html.escape(last_update)}</div>
         </div>
     </div>
 </header>
