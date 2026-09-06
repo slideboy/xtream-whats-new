@@ -36,7 +36,7 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "Xtream What's New"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7-dev"
 APP_USER_AGENT = f"Mozilla/5.0 Xtream-Whats-New/{APP_VERSION}"
 
 def utc_now():
