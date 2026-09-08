@@ -3,6 +3,20 @@
 [English](README.md)
 
 Xtream What's New est une application Docker légère qui surveille un catalogue VOD et Séries compatible Xtream et affiche ce qui a changé depuis les scans précédents.
+
+## Points forts
+
+- 🎬 Détecte les nouveaux films, séries et épisodes, ainsi que les suppressions du catalogue et autres changements.
+- 🌍 Filtre la surveillance par pays et par catégories fournisseur.
+- 🌓 Thèmes clair et sombre avec mémorisation du choix dans le navigateur.
+- 📧 Récapitulatifs email configurables pour les films, séries, épisodes, catégories et suppressions.
+- ⚠️ Alertes email immédiates en cas d'échec de scan ou de sauvegarde.
+- 🔄 Fréquence des scans automatiques configurable directement depuis l'interface web.
+- 💾 Sauvegardes SQLite planifiées intégrées avec rétention configurable.
+- 🔎 Historique consultable et recherchable sur Aujourd'hui, 7 jours ou 30 jours.
+- 🧹 Nettoie à l'affichage les préfixes fournisseur tels que `|FR|` sans modifier les données originales stockées.
+- 🐳 Conçu pour un auto-hébergement simple avec Docker Compose et les images GHCR.
+
 ![Tableau de bord Xtream What's New](docs/images/dashboard.png)
 
 
