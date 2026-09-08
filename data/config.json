@@ -4,6 +4,5 @@
   "series_fetch_delay_seconds": 0.7,
   "request_timeout_seconds": 25,
   "port": 36401,
-  "timezone": "Europe/Paris",
-  "user_agent": "Mozilla/5.0 Xtream-Whats-New/1.0.5-dev"
+  "timezone": "Europe/Paris"
 }
