@@ -4,7 +4,7 @@ Maintainer checklist for Xtream What's New.
 
 ## Release policy
 
-Docker images are published **only when a Git tag beginning with `v` is created**.
+Docker images are published **only for stable release tags matching `vMAJOR.MINOR.PATCH`**.
 
 Normal commits to `main`, including documentation changes, do not publish a new Docker image.
 
@@ -13,7 +13,7 @@ Examples:
 ```text
 README update        → no Docker image
 Documentation update → no Docker image
-Tag v1.0.4           → Docker image published
+Tag vMAJOR.MINOR.PATCH → Docker image published
 ```
 
 The publishing workflow is:
@@ -42,10 +42,10 @@ Do not create a new release only for README or documentation changes.
 
 ## Docker images
 
-When a release tag such as:
+When a stable release tag matching:
 
 ```text
-v1.0.4
+vMAJOR.MINOR.PATCH
 ```
 
 is published, GitHub Actions builds the Docker image for:
@@ -58,9 +58,9 @@ linux/arm64
 and publishes the following GHCR tags:
 
 ```text
-ghcr.io/slideboy/xtream-whats-new:v1.0.4
-ghcr.io/slideboy/xtream-whats-new:1.0.4
-ghcr.io/slideboy/xtream-whats-new:1.0
+ghcr.io/slideboy/xtream-whats-new:vMAJOR.MINOR.PATCH
+ghcr.io/slideboy/xtream-whats-new:MAJOR.MINOR.PATCH
+ghcr.io/slideboy/xtream-whats-new:MAJOR.MINOR
 ghcr.io/slideboy/xtream-whats-new:latest
 ```
 
@@ -72,10 +72,10 @@ The public Compose file continues to use:
 ghcr.io/slideboy/xtream-whats-new:latest
 ```
 
-Users who prefer to pin a specific version may instead use, for example:
+Users who prefer to pin a specific version may instead use the corresponding stable tag, for example:
 
 ```text
-ghcr.io/slideboy/xtream-whats-new:v1.0.4
+ghcr.io/slideboy/xtream-whats-new:vMAJOR.MINOR.PATCH
 ```
 
 ## Publishing a new release
@@ -94,17 +94,17 @@ Then:
 
 1. Open **Releases** on GitHub.
 2. Choose **Draft a new release**.
-3. Create a new tag using semantic versioning, for example:
+3. Create a stable tag using semantic versioning:
 
 ```text
-v1.0.4
+vMAJOR.MINOR.PATCH
 ```
 
 4. Target the `main` branch.
 5. Add a clear release title and release notes.
 6. Publish the Release.
 
-Creating the `v*` tag automatically triggers the **Publish Docker image** workflow.
+Pushing a stable `vMAJOR.MINOR.PATCH` tag automatically triggers the **Publish Docker image** workflow.
 
 ## After publishing
 
@@ -119,7 +119,7 @@ Verify that:
 Example:
 
 ```bash
-docker pull ghcr.io/slideboy/xtream-whats-new:v1.0.4
+docker pull ghcr.io/slideboy/xtream-whats-new:vMAJOR.MINOR.PATCH
 ```
 
 Optionally test:
