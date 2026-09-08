@@ -36,7 +36,7 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "Xtream What's New"
-APP_VERSION = "1.0.7-dev"
+APP_VERSION = "1.0.7"
 APP_USER_AGENT = f"Mozilla/5.0 Xtream-Whats-New/{APP_VERSION}"
 
 def utc_now():
@@ -367,30 +367,6 @@ def movie_identity_from_item(item, name=""):
         "normalized_name": normalize_movie_title(name, year),
     }
 
-
-def _movie_row_identity(row):
-    # Compatible avec une base juste migrée : les anciennes lignes n'ont pas
-    # encore forcément leurs nouvelles colonnes renseignées.
-    keys = set(row.keys())
-    name = safe_text(row["name"])
-    year = row["year"] if "year" in keys else None
-    try:
-        year = int(year) if year not in (None, "") else None
-    except Exception:
-        year = None
-    if year is None:
-        year = movie_year_from_item({}, name)
-
-    normalized = safe_text(row["normalized_name"]) if "normalized_name" in keys else ""
-    if not normalized:
-        normalized = normalize_movie_title(name, year)
-
-    return {
-        "tmdb_id": safe_text(row["tmdb_id"]).strip() if "tmdb_id" in keys else "",
-        "imdb_id": safe_text(row["imdb_id"]).strip() if "imdb_id" in keys else "",
-        "year": year,
-        "normalized_name": normalized,
-    }
 
 
 def _movie_category_compatible(old_category, new_category, monitored_category_norms):
@@ -997,6 +973,7 @@ def init_db():
             "email_notify_series": "1",
             "email_notify_episodes": "1",
             "email_notify_categories": "0",
+            "email_notify_removals": "1",
             "email_notify_scan_errors": "1",
             "email_notify_backup_errors": "1",
             "email_max_items": "25",
@@ -1159,6 +1136,7 @@ def get_email_settings(conn, include_password=False):
         "notify_series": _email_bool(value("email_notify_series", "1")),
         "notify_episodes": _email_bool(value("email_notify_episodes", "1")),
         "notify_categories": _email_bool(value("email_notify_categories", "0")),
+        "notify_removals": _email_bool(value("email_notify_removals", "1")),
         "notify_scan_errors": _email_bool(value("email_notify_scan_errors", "1")),
         "notify_backup_errors": _email_bool(value("email_notify_backup_errors", "1")),
         "digest_hours": digest_hours,
@@ -1207,6 +1185,7 @@ def email_settings_from_form(conn, form):
         "notify_series": "email_notify_series" in form,
         "notify_episodes": "email_notify_episodes" in form,
         "notify_categories": "email_notify_categories" in form,
+        "notify_removals": "email_notify_removals" in form,
         "notify_scan_errors": "email_notify_scan_errors" in form,
         "notify_backup_errors": "email_notify_backup_errors" in form,
         "digest_hours": digest_hours,
@@ -1229,6 +1208,7 @@ def save_email_settings(conn, form):
         "email_notify_series": "1" if settings["notify_series"] else "0",
         "email_notify_episodes": "1" if settings["notify_episodes"] else "0",
         "email_notify_categories": "1" if settings["notify_categories"] else "0",
+        "email_notify_removals": "1" if settings["notify_removals"] else "0",
         "email_notify_scan_errors": "1" if settings["notify_scan_errors"] else "0",
         "email_notify_backup_errors": "1" if settings["notify_backup_errors"] else "0",
         "email_digest_hours": str(settings["digest_hours"]),
@@ -1244,7 +1224,7 @@ def save_email_settings(conn, form):
         or old.get("digest_hours") != settings.get("digest_hours")
     )
 
-    # Si les notifications sont coupées, les nouveautés en attente ne doivent
+    # Si les notifications sont coupées, les changements en attente ne doivent
     # pas ressortir plusieurs heures/jours plus tard lors d'une réactivation.
     if not settings.get("enabled"):
         conn.execute("DELETE FROM email_digest_queue")
@@ -1276,9 +1256,12 @@ def _email_html_from_text(subject, body, lang="fr"):
     automatic_label = ui_text(lang, "Notification automatique", "Automated notification")
     country_heading = ui_text(lang, "Par pays / zone", "By country / zone")
     lines = raw_body.splitlines()
+    digest_headers = {
+        f"{APP_NAME} — Récapitulatif".lower(),
+        f"{APP_NAME} — Digest".lower(),
+    }
     digest_mode = any(
-        "récapitulatif des nouveautés" in safe_text(line).lower()
-        or "what's new digest" in safe_text(line).lower()
+        safe_text(line).strip().lower() in digest_headers
         for line in lines[:6]
     )
 
@@ -1316,6 +1299,8 @@ def _email_html_from_text(subject, body, lang="fr"):
         "episodes": ("▶️", "Episodes"),
         "catégories": ("📂", "Catégories"),
         "categories": ("📂", "Categories"),
+        "suppressions": ("❌", "Suppressions"),
+        "removals": ("❌", "Removals"),
     }
 
     section_icons = {
@@ -1327,11 +1312,12 @@ def _email_html_from_text(subject, body, lang="fr"):
         "EPISODES": "▶️",
         "CATÉGORIES": "📂",
         "CATEGORIES": "📂",
+        "SUPPRESSIONS": "❌",
+        "REMOVALS": "❌",
     }
 
     stats = []
     period = ""
-    preview = ""
     countries = []
     sections = []
     current_section = None
@@ -1346,13 +1332,7 @@ def _email_html_from_text(subject, body, lang="fr"):
         lower = line.lower()
         upper = line.upper()
 
-        if APP_NAME.lower() in lower and (
-            "récapitulatif des nouveautés" in lower or "what's new digest" in lower
-        ):
-            continue
-
-        if lower.startswith("aperçu") or lower.startswith("preview"):
-            preview = line
+        if lower in digest_headers:
             continue
 
         if lower.startswith("période") or lower.startswith("period"):
@@ -1360,7 +1340,7 @@ def _email_html_from_text(subject, body, lang="fr"):
             continue
 
         stat_match = re.match(
-            r"^(films|movies|séries|series|épisodes|episodes|catégories|categories)\s*:\s*(\d+)\s*$",
+            r"^(films|movies|séries|series|épisodes|episodes|catégories|categories|suppressions|removals)\s*:\s*(\d+)\s*$",
             line,
             re.IGNORECASE,
         )
@@ -1394,13 +1374,13 @@ def _email_html_from_text(subject, body, lang="fr"):
         if line.startswith("…") or line.startswith("..."):
             notes.append(line)
 
-    stat_bg = ("#eff6ff", "#f5f3ff", "#ecfdf5", "#fff7ed")
-    stat_fg = ("#1d4ed8", "#6d28d9", "#047857", "#c2410c")
+    stat_bg = ("#eff6ff", "#f5f3ff", "#ecfdf5", "#fff7ed", "#fff1f2")
+    stat_fg = ("#1d4ed8", "#6d28d9", "#047857", "#c2410c", "#be123c")
 
     stat_cells = []
-    for idx, (icon, label, value) in enumerate(stats[:4]):
+    for idx, (icon, label, value) in enumerate(stats[:5]):
         stat_cells.append(
-            f'<td width="25%" valign="top" style="padding:4px;">'
+            f'<td width="20%" valign="top" style="padding:4px;">'
             f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">'
             f'<tr><td align="center" style="background:{stat_bg[idx]};border-radius:12px;padding:14px 6px;">'
             f'<div style="font-size:25px;font-weight:800;color:{stat_fg[idx]};line-height:1;">{html.escape(value)}</div>'
@@ -1413,14 +1393,6 @@ def _email_html_from_text(subject, body, lang="fr"):
         stats_html = (
             '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:14px 0 20px;">'
             '<tr>' + "".join(stat_cells) + '</tr></table>'
-        )
-
-    preview_html = ""
-    if preview:
-        preview_html = (
-            '<div style="display:inline-block;background:#fef3c7;color:#92400e;'
-            'border-radius:999px;padding:6px 10px;font-size:11px;font-weight:700;margin-bottom:12px;">'
-            + html.escape(preview) + '</div>'
         )
 
     period_html = ""
@@ -1500,7 +1472,6 @@ style="width:100%;max-width:640px;background:#ffffff;border-radius:16px;overflow
 
 <tr>
 <td style="padding:24px 28px 30px;font-family:Arial,sans-serif;">
-{preview_html}
 {period_html}
 {stats_html}
 {countries_html}
@@ -1586,6 +1557,16 @@ def email_event_kind_enabled(kind, settings):
         or (kind == "series" and settings.get("notify_series"))
         or (kind == "episode" and settings.get("notify_episodes"))
         or (kind in ("vod_category", "series_category") and settings.get("notify_categories"))
+        or (
+            kind in (
+                "movie_removed",
+                "series_removed",
+                "episode_removed",
+                "vod_category_removed",
+                "series_category_removed",
+            )
+            and settings.get("notify_removals")
+        )
     )
 
 
@@ -1653,14 +1634,24 @@ def build_email_digest(events, settings, period_start=None, period_end=None):
         "series": sum(1 for e in selected if e["kind"] == "series"),
         "episode": sum(1 for e in selected if e["kind"] == "episode"),
         "category": sum(1 for e in selected if e["kind"] in ("vod_category", "series_category")),
+        "removal": sum(
+            1 for e in selected
+            if e["kind"] in (
+                "movie_removed",
+                "series_removed",
+                "episode_removed",
+                "vod_category_removed",
+                "series_category_removed",
+            )
+        ),
     }
     total = sum(counts.values())
     if lang == "en":
-        subject = f"{APP_NAME} — Digest: {total} new item{'s' if total != 1 else ''}"
-        lines = [f"{APP_NAME} — What's new digest", ""]
+        subject = f"{APP_NAME} — Digest: {total} change{'s' if total != 1 else ''}"
+        lines = [f"{APP_NAME} — Digest", ""]
     else:
-        subject = f"{APP_NAME} — Récapitulatif : {total} nouveauté{'s' if total != 1 else ''}"
-        lines = [f"{APP_NAME} — Récapitulatif des nouveautés", ""]
+        subject = f"{APP_NAME} — Récapitulatif : {total} changement{'s' if total != 1 else ''}"
+        lines = [f"{APP_NAME} — Récapitulatif", ""]
 
     if period_start and period_end:
         lines.append(f"{ui_text(lang, 'Période', 'Period')} : {_format_email_dt(period_start)} → {_format_email_dt(period_end)}")
@@ -1670,6 +1661,7 @@ def build_email_digest(events, settings, period_start=None, period_end=None):
         f"{ui_text(lang, 'Séries', 'Series')} : {counts['series']}",
         f"{ui_text(lang, 'Épisodes', 'Episodes')} : {counts['episode']}",
         f"{ui_text(lang, 'Catégories', 'Categories')} : {counts['category']}",
+        f"{ui_text(lang, 'Suppressions', 'Removals')} : {counts['removal']}",
     ])
 
     countries = {}
@@ -1714,6 +1706,25 @@ def build_email_digest(events, settings, period_start=None, period_end=None):
     if categories:
         detail_lines.extend(["", ui_text(lang, "CATÉGORIES", "CATEGORIES")])
         detail_lines.extend(f"• {safe_text(e['title'])}" for e in categories)
+
+    removals = [
+        e for e in selected
+        if e["kind"] in (
+            "movie_removed",
+            "series_removed",
+            "episode_removed",
+            "vod_category_removed",
+            "series_category_removed",
+        )
+    ]
+    if removals:
+        detail_lines.extend(["", ui_text(lang, "SUPPRESSIONS", "REMOVALS")])
+        for e in removals:
+            title = clean_display_title(e["title"])
+            subtitle = safe_text(e["subtitle"]).strip()
+            detail_lines.append(
+                f"• {title}" + (f" — {subtitle}" if subtitle else "")
+            )
 
     visible = []
     content_count = 0
@@ -1763,7 +1774,7 @@ def _queued_email_rows(conn):
 
 
 def queue_email_notifications(events):
-    """Ajoute les nouveautés du scan au prochain récapitulatif email."""
+    """Ajoute les changements du scan au prochain récapitulatif email."""
     try:
         with db() as conn:
             settings = get_email_settings(conn, include_password=True)
@@ -1842,7 +1853,7 @@ def flush_email_digest(force=False):
             set_meta(conn, "email_digest_last_sent", iso_now())
             conn.commit()
         record_email_result(True)
-        print(f"[OK] Récapitulatif email envoyé ({len(selected)} nouveauté(s)).", flush=True)
+        print(f"[OK] Récapitulatif email envoyé ({len(selected)} changement(s)).", flush=True)
         return True
     except Exception as exc:
         message = sanitize_watcher_error(f"{type(exc).__name__}: {exc}")
@@ -3826,6 +3837,11 @@ def fmt_dt(value):
     except Exception:
         return safe_text(value)
 
+def clean_display_title(title):
+    if not title:
+        return ""
+    return re.sub(r"^\|[A-Za-z]{2}\|\s*", "", safe_text(title))
+
 def fmt_dt_short(value):
     if not value:
         return "—"
@@ -3860,7 +3876,7 @@ def render_page(days):
                 r["key"]: r["value"]
                 for r in conn.execute("SELECT * FROM meta")
             }
-            
+
             last_update_row = conn.execute("""
                 SELECT detected_at
                 FROM events
@@ -3872,15 +3888,11 @@ def render_page(days):
                 fmt_dt_short(last_update_row["detected_at"])
                 if last_update_row else "—"
             )
-            
+
             lang = normalize_ui_language(meta.get("ui_language", "fr"))
 
-            pending = conn.execute("""
-                SELECT COUNT(*) AS n FROM series WHERE pending=1 AND active=1
-            """).fetchone()["n"]
-
             enabled_category_names = current_enabled_category_names(conn)
-            enabled_country_codes, enabled_country_labels = enabled_country_summary(conn, lang)
+            _, enabled_country_labels = enabled_country_summary(conn, lang)
             settings_rows = conn.execute("""
                 SELECT a.kind,a.category_id,a.name,a.country_code,
                        COALESCE(p.enabled,0) AS category_enabled,
@@ -4162,11 +4174,12 @@ def render_page(days):
           <label><input type="checkbox" name="email_notify_series" value="1"{" checked" if email_settings["notify_series"] else ""}> {L("Nouvelles séries", "New series")}</label>
           <label><input type="checkbox" name="email_notify_episodes" value="1"{" checked" if email_settings["notify_episodes"] else ""}> {L("Nouveaux épisodes", "New episodes")}</label>
           <label><input type="checkbox" name="email_notify_categories" value="1"{" checked" if email_settings["notify_categories"] else ""}> {L("Nouvelles catégories", "New categories")}</label>
+          <label><input type="checkbox" name="email_notify_removals" value="1"{" checked" if email_settings["notify_removals"] else ""}> {L("Suppressions", "Removals")}</label>
           <label><input type="checkbox" name="email_notify_scan_errors" value="1"{" checked" if email_settings["notify_scan_errors"] else ""}> {L("Erreurs de scan", "Scan errors")}</label>
           <label><input type="checkbox" name="email_notify_backup_errors" value="1"{" checked" if email_settings["notify_backup_errors"] else ""}> {L("Échec de sauvegarde", "Backup failure")}</label>
         </div>
         <div class="email-info">
-          {L("Les nouveautés sont regroupées selon la fréquence choisie ; aucun email n’est envoyé si la période ne contient rien.", "New items are grouped according to the selected frequency; no email is sent when the period contains no changes.")}
+          {L("Les changements sont regroupés selon la fréquence choisie ; aucun email n’est envoyé si la période ne contient rien.", "Changes are grouped according to the selected frequency; no email is sent when the period contains no changes.")}
           {L("Les épisodes d’une même série sont regroupés dans le récapitulatif. Les erreurs de scan/sauvegarde restent immédiates.", "Episodes from the same series are grouped in the digest. Scan and backup errors remain immediate.")}
           {L("Les identifiants SMTP sont lus exclusivement depuis le fichier .env et ne sont jamais enregistrés dans SQLite.", "SMTP credentials are read exclusively from the .env file and are never stored in SQLite.")}
         </div>
@@ -4285,7 +4298,7 @@ def render_page(days):
                 grouped_events = episode_groups.get(key, [e])
                 episode_count = len(grouped_events)
                 episode_word = L("épisode", "episode") if episode_count == 1 else L("épisodes", "episodes")
-                title = html.escape(e["title"] or "")
+                title = html.escape(clean_display_title(e["title"] or ""))
                 cat = html.escape(e["category"] or "")
                 detected = html.escape(fmt_dt(e["detected_at"]))
                 searchable = html.escape(
@@ -4321,7 +4334,7 @@ def render_page(days):
                 continue
 
             filter_kind, emoji = kind_labels.get(kind, ("autre", "ℹ️"))
-            title = html.escape(e["title"] or "")
+            title = html.escape(clean_display_title(e["title"] or ""))
             raw_subtitle = safe_text(e["subtitle"])
             if lang == "en" and raw_subtitle in generated_subtitle_en:
                 raw_subtitle = generated_subtitle_en[raw_subtitle]
@@ -4441,7 +4454,7 @@ def render_page(days):
         return "".join(out)
 
     def section(section_id, title, emoji, kinds, section_count, open_when_nonempty=False):
-        # Ne pas afficher les sections sans nouveauté.
+        # Ne pas afficher les sections sans changement.
         if not section_count:
             return ""
 
@@ -4497,13 +4510,6 @@ def render_page(days):
 
     interval = safe_text(scan_status.get("interval_minutes", scan_settings.get("interval_minutes", 15)))
     duration = safe_text(meta.get("last_sync_duration_seconds", "—"))
-    confirm_scans = safe_text(
-        meta.get(
-            "deletion_confirmation_scans",
-            CFG.get("deletion_confirmation_scans", 2)
-        )
-    )
-
     tabs = "".join(
         f'<a class="period-tab {"active" if days==d else ""}" href="/?days={d}">'
         f'{L("Aujourd’hui", "Today") if d==1 else str(d)+" "+L("jours", "days")}</a>'
@@ -4532,30 +4538,145 @@ def render_page(days):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(APP_NAME)}</title>
+<script>
+(() => {{
+    try {{
+        const savedTheme = localStorage.getItem("xtream-theme");
+        if (savedTheme === "light" || savedTheme === "dark") {{
+            document.documentElement.setAttribute("data-theme", savedTheme);
+        }}
+    }} catch (_) {{}}
+}})();
+</script>
 <style>
 :root {{
     color-scheme: dark;
+
     --bg: #080b11;
+    --bg-glow: rgba(139,108,255,.09);
     --panel: #101620;
     --panel-2: #151d29;
+
     --line: #263244;
+    --line-strong: #35455d;
+    --line-medium: #304158;
+    --modal-border: #2b3950;
+    --settings-line: #27344a;
+    --control-border: #34445e;
+    --control-border-soft: #2c3b53;
+    --category-border: #293850;
+    --country-enable-border: #2d3b53;
+    --country-enable-bg: #151f30;
+    --category-head-bg: #131e2e;
+    --mini-border: #354761;
+    --mini-bg: #1a2639;
+    --category-hover-bg: #172337;
+
     --text: #f4f7fb;
+    --text-soft: #c8d1dd;
+    --text-bright: #e8edf5;
+    --strong-text: #ffffff;
     --muted: #8e9caf;
+    --muted-2: #8fa2bd;
+    --muted-3: #8295b0;
+    --label: #9cafc7;
+
     --accent: #8b6cff;
     --accent-soft: rgba(139,108,255,.14);
+
     --good: #38c793;
     --good-soft: rgba(56,199,147,.13);
+    --good-border: #39765f;
+    --good-border-strong: #4c9b7a;
+    --good-panel: #173429;
+    --good-panel-muted: #132a22;
+    --good-panel-active: #1b3b2f;
+    --good-text: #a8e8cf;
+    --good-text-soft: #b9efd9;
+    --good-text-strong: #d8f7e9;
+    --good-hover: #204537;
+
     --warn: #e8a44a;
     --warn-soft: rgba(232,164,74,.13);
+    --warn-border: rgba(232,164,74,.35);
+    --warn-text: #f0c987;
+
     --danger: #ef6a76;
     --danger-soft: rgba(239,106,118,.13);
+    --danger-border: #87404a;
+    --danger-panel: #351a20;
+    --danger-text: #ffc3ca;
+
+    --hero-bg: linear-gradient(180deg, #172233 0%, #0f1723 100%);
+    --toolbar-bg: linear-gradient(180deg, #141e2c 0%, #0e151f 100%);
+    --card-bg: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
+    --section-bg: linear-gradient(180deg, #182334 0%, #101824 100%);
+
+    --glass-bg: rgba(255,255,255,.025);
+    --day-bg: rgba(255,255,255,.018);
+    --hover-bg-strong: rgba(255,255,255,.03);
+    --code-bg: rgba(255,255,255,.05);
+    --hairline: rgba(255,255,255,.055);
+    --hairline-strong: rgba(255,255,255,.06);
+
+    --shadow-card: 0 12px 32px rgba(0,0,0,.38);
+    --shadow-stat: 0 12px 30px rgba(0,0,0,.40);
+    --shadow-strong: 0 16px 42px rgba(0,0,0,.42);
+    --shadow-inset: inset 0 1px 0 rgba(255,255,255,.07);
+    --shadow-inset-soft: inset 0 1px 0 rgba(255,255,255,.055);
+    --toast-shadow: 0 12px 35px rgba(0,0,0,.35);
+    --modal-shadow: 0 24px 80px rgba(0,0,0,.45);
+
+    --overlay: rgba(4,8,15,.78);
+    --settings-bg: #0f1724;
+    --settings-alt: #0c1420;
+    --settings-section: #111d2c;
+    --settings-section-2: #101a28;
+    --settings-section-3: #111b29;
+
+    --button-bg: #182235;
+    --button-hover: #22304a;
+    --button-text: #e9eef7;
+    --secondary-bg: #172235;
+    --secondary-text: #d9e2ef;
+    --input-bg: #111b2b;
+    --toggle-text: #dce5f1;
+    --active-tab-bg: #1d2b43;
+    --active-tab-text: #ffffff;
+
+    --baseline-warning-border: #7d3b45;
+    --baseline-warning-bg: #2a171b;
+    --baseline-warning-text: #ff9da8;
+    --baseline-reset-border: #7a5a2f;
+    --baseline-reset-bg: #2a2115;
+    --baseline-reset-text: #f1c981;
+    --baseline-reset-hover: #382a18;
+
+    --primary-border: #4d78ff;
+    --primary-bg: #2e5ee8;
+    --primary-text: #ffffff;
+
+    --info-border: #3e6fa8;
+    --info-bg: #172d47;
+    --info-text: #b9dcff;
+    --info-hover: #203d5f;
+
+    --email-test-border: #4c6488;
+    --email-test-bg: #18263b;
+    --email-test-text: #d7e5fa;
+    --email-test-hover: #22344f;
+
+    --country-tab-text: #aebbd0;
+    --mini-text: #cad5e5;
+    --info-strong: #cbd7e6;
+    --email-events-text: #c9d6e7;
 }}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
 body {{
     margin: 0;
     background:
-        radial-gradient(circle at top right, rgba(139,108,255,.09), transparent 28rem),
+        radial-gradient(circle at top right, var(--bg-glow), transparent 28rem),
         var(--bg);
     color: var(--text);
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -4567,13 +4688,13 @@ button, input {{ font: inherit; }}
     padding: 24px 0 42px;
 }}
 .hero {{
-    background: linear-gradient(180deg, #172233 0%, #0f1723 100%);
-    border: 1px solid #35455d;
+    background: var(--hero-bg);
+    border: 1px solid var(--line-strong);
     border-radius: 22px;
     padding: 20px;
     box-shadow:
-        0 16px 42px rgba(0,0,0,.42),
-        inset 0 1px 0 rgba(255,255,255,.07);
+        var(--shadow-strong),
+        var(--shadow-inset);
 }}
 .hero-top {{
     display: flex;
@@ -4622,9 +4743,9 @@ h1 {{
     padding:12px 14px;
     border-radius:11px;
     border:1px solid var(--line);
-    background:#151d29;
-    color:#f4f7fb;
-    box-shadow:0 12px 35px rgba(0,0,0,.35);
+    background:var(--panel-2);
+    color:var(--text);
+    box-shadow:var(--toast-shadow);
     font-size:13px;
     font-weight:700;
     line-height:1.4;
@@ -4637,29 +4758,35 @@ h1 {{
     transform:translateY(0);
 }}
 .toast.success {{
-    border-color:#39765f;
-    background:#173429;
-    color:#b9efd9;
+    border-color:var(--good-border);
+    background:var(--good-panel);
+    color:var(--good-text-soft);
 }}
 .toast.error {{
-    border-color:#87404a;
-    background:#351a20;
-    color:#ffc3ca;
+    border-color:var(--danger-border);
+    background:var(--danger-panel);
+    color:var(--danger-text);
 }}
 .hero-sub {{
     color: var(--muted);
     font-size: 13px;
 }}
-.status-pill {{
+.status-pill,
+.language-switch,
+.theme-switch {{
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 11px;
-    border-radius: 999px;
+    gap: 6px;
+    min-height: 34px;
+    padding: 0 10px;
     border: 1px solid var(--line);
-    background: rgba(255,255,255,.025);
-    font-size: 13px;
-    font-weight: 750;
+    border-radius: 999px;
+    background: var(--glass-bg);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1;
+    white-space: nowrap;
 }}
 .status-dot {{
     width: 8px;
@@ -4683,13 +4810,13 @@ h1 {{
     margin-top: 18px;
 }}
 .quick {{
-    background: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
-    border: 1px solid #35455d;
+    background: var(--card-bg);
+    border: 1px solid var(--line-strong);
     border-radius: 14px;
     padding: 11px 12px;
     box-shadow:
-        0 10px 26px rgba(0,0,0,.38),
-        inset 0 1px 0 rgba(255,255,255,.07);
+        var(--shadow-card),
+        var(--shadow-inset);
 }}
 .quick-label {{
     color: var(--muted);
@@ -4708,16 +4835,6 @@ h1 {{
     flex-wrap:wrap;
     align-items:center;
     justify-content:flex-end;
-}}
-.language-switch {{
-    display:flex;
-    align-items:center;
-    gap:6px;
-    min-height:34px;
-    padding:0 8px;
-    border:1px solid var(--line);
-    border-radius:999px;
-    background:rgba(255,255,255,.025);
 }}
 .language-switch select {{
     border:0;
@@ -4742,13 +4859,13 @@ h1 {{
     display: flex;
     flex-direction:column;
     gap: 9px;
-    background: linear-gradient(180deg, #141e2c 0%, #0e151f 100%);
+    background: var(--toolbar-bg);
     backdrop-filter: blur(16px);
-    border: 1px solid #304158;
+    border: 1px solid var(--line-medium);
     border-radius: 16px;
     box-shadow:
-        0 12px 32px rgba(0,0,0,.38),
-        inset 0 1px 0 rgba(255,255,255,.055);
+        var(--shadow-card),
+        var(--shadow-inset-soft);
 }}
 .toolbar-main {{
     width:100%;
@@ -4812,34 +4929,41 @@ h1 {{
     margin-bottom: 16px;
 }}
 .stat {{
-    background: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
-    border: 1px solid #35455d;
-    border-radius: 16px;
-    padding: 13px;
+    display: flex;
+    flex-direction: column;
+    background: var(--card-bg);
+    border: 1px solid var(--line-strong);
+    border-radius: 14px;
+    padding: 11px 12px;
     min-width: 0;
     box-shadow:
-        0 12px 30px rgba(0,0,0,.40),
-        inset 0 1px 0 rgba(255,255,255,.07);
+        var(--shadow-card),
+        var(--shadow-inset);
 }}
 .stat strong {{
+    order: 2;
     display: block;
-    font-size: 25px;
-    line-height: 1;
-    margin-bottom: 6px;
+    margin-top: 3px;
+    font-size: 22px;
+    line-height: 1.05;
+    font-weight: 780;
 }}
 .stat span {{
+    order: 1;
     color: var(--muted);
-    font-size: 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
 }}
 .section {{
-    background: linear-gradient(180deg, #182334 0%, #101824 100%);
-    border: 1px solid #304158;
+    background: var(--section-bg);
+    border: 1px solid var(--line-medium);
     border-radius: 17px;
     margin-bottom: 12px;
     overflow: hidden;
     box-shadow:
-        0 12px 32px rgba(0,0,0,.38),
-        inset 0 1px 0 rgba(255,255,255,.055);
+        var(--shadow-card),
+        var(--shadow-inset-soft);
 }}
 .section > summary {{
     list-style: none;
@@ -4889,9 +5013,9 @@ h1 {{
     flex: 1;
 }}
 .day-group {{
-    border: 1px solid rgba(255,255,255,.07);
+    border: 1px solid var(--hairline);
     border-radius: 12px;
-    background: rgba(255,255,255,.018);
+    background: var(--day-bg);
     margin: 8px 0;
     overflow: hidden;
 }}
@@ -4906,11 +5030,11 @@ h1 {{
     user-select: none;
     transition: background .15s ease;
 }}
-.day-group > summary:hover {{ background: rgba(255,255,255,.03); }}
+.day-group > summary:hover {{ background: var(--hover-bg-strong); }}
 .day-group > summary::-webkit-details-marker {{ display: none; }}
 .day-label {{
     font-weight: 800;
-    color: #e8edf5;
+    color: var(--text-bright);
 }}
 .day-label::before {{
     content: "›";
@@ -4943,11 +5067,11 @@ h1 {{
     white-space: nowrap;
 }}
 .day-breakdown-number {{
-    color:#fff;
+    color:var(--strong-text);
     font-weight:800;
 }}
 .day-body {{
-    border-top: 1px solid rgba(255,255,255,.055);
+    border-top: 1px solid var(--hairline);
     padding: 5px 4px 6px;
 }}
 .event-card {{
@@ -4959,7 +5083,7 @@ h1 {{
     transition: background .15s ease, transform .15s ease;
 }}
 .event-card:hover {{
-    background: rgba(255,255,255,.025);
+    background: var(--glass-bg);
     transform: translateY(-1px);
 }}
 .event-card.hidden {{ display: none; }}
@@ -4987,7 +5111,7 @@ h1 {{
     overflow-wrap: anywhere;
 }}
 .event-subtitle {{
-    color: #c8d1dd;
+    color: var(--text-soft);
     font-size: 13px;
     margin-top: 3px;
 }}
@@ -5029,20 +5153,20 @@ h1 {{
     gap: 10px;
 }}
 .system-value {{
-    color:#fff;
+    color:var(--strong-text);
     font-weight:700;
 }}
 .system-card {{
-    background: linear-gradient(180deg, #1b2738 0%, #111a27 100%);
-    border: 1px solid #35455d;
+    background: var(--card-bg);
+    border: 1px solid var(--line-strong);
     border-radius: 16px;
     padding: 14px;
     color: var(--muted);
     font-size: 12px;
     line-height: 1.75;
     box-shadow:
-        0 12px 30px rgba(0,0,0,.40),
-        inset 0 1px 0 rgba(255,255,255,.07);
+        var(--shadow-stat),
+        var(--shadow-inset);
 }}
 .system-card b {{ color: var(--text); }}
 .watcher-errors {{
@@ -5053,8 +5177,8 @@ h1 {{
     grid-template-columns: 125px 1fr;
     gap: 12px;
     padding: 10px 2px;
-    border-bottom: 1px solid rgba(255,255,255,.06);
-    color: #f0c987;
+    border-bottom: 1px solid var(--hairline-strong);
+    color: var(--warn-text);
     font-size: 12px;
     line-height: 1.45;
 }}
@@ -5069,14 +5193,14 @@ h1 {{
 .warning {{
     margin-top: 10px;
     padding: 11px;
-    border: 1px solid rgba(232,164,74,.35);
+    border: 1px solid var(--warn-border);
     border-radius: 12px;
     background: var(--warn-soft);
-    color: #f0c987;
+    color: var(--warn-text);
     font-size: 12px;
 }}
 code {{
-    background: rgba(255,255,255,.05);
+    background: var(--code-bg);
     padding: 2px 5px;
     border-radius: 5px;
 }}
@@ -5113,9 +5237,9 @@ code {{
 
 /* --- Paramètres Pays / Catégories --- */
 .settings-btn, .refresh-btn {{
-    border:1px solid #2b3950;
-    background:#182235;
-    color:#e9eef7;
+    border:1px solid var(--modal-border);
+    background:var(--button-bg);
+    color:var(--button-text);
     border-radius:10px;
     padding:10px 13px;
     cursor:pointer;
@@ -5123,119 +5247,250 @@ code {{
     font-size:13px;
 }}
 .settings-btn:hover, .refresh-btn:hover {{
-    background:#22304a;
+    background:var(--button-hover);
 }}
-.modal {{ position:fixed; inset:0; background:rgba(4,8,15,.78); display:none; align-items:center; justify-content:center; padding:20px; z-index:9999; }}
+.modal {{ position:fixed; inset:0; background:var(--overlay); display:none; align-items:center; justify-content:center; padding:20px; z-index:9999; }}
 .modal.open {{ display:flex; }}
-.modal-card {{ width:min(1120px,96vw); max-height:92vh; overflow:hidden; background:#0f1724; border:1px solid #2b3950; border-radius:18px; box-shadow:0 24px 80px rgba(0,0,0,.45); display:flex; flex-direction:column; }}
-.modal-head {{ display:flex; justify-content:space-between; align-items:center; padding:18px 20px; border-bottom:1px solid #27344a; }}
+.modal-card {{ width:min(1120px,96vw); max-height:92vh; overflow:hidden; background:var(--settings-bg); border:1px solid var(--modal-border); border-radius:18px; box-shadow:var(--modal-shadow); display:flex; flex-direction:column; }}
+.modal-head {{ display:flex; justify-content:space-between; align-items:center; padding:18px 20px; border-bottom:1px solid var(--settings-line); }}
 .modal-head h2 {{ margin:2px 0 0; font-size:22px; }}
-.modal-close {{ width:38px; height:38px; border-radius:10px; border:1px solid #34445e; background:#182235; color:#fff; font-size:25px; cursor:pointer; }}
+.modal-close {{ width:38px; height:38px; border-radius:10px; border:1px solid var(--control-border); background:var(--button-bg); color:var(--strong-text); font-size:25px; cursor:pointer; }}
 #settingsForm {{ display:flex; flex-direction:column; flex:1 1 auto; min-height:0; overflow-y:auto; overscroll-behavior:contain; }}
-.settings-tools {{ padding:14px 20px; border-bottom:1px solid #27344a; }}
-.settings-search {{ width:100%; padding:11px 12px; border-radius:10px; border:1px solid #34445e; background:#111b2b; color:#fff; }}
-.settings-hint {{ color:#8fa2bd; font-size:12px; margin-top:8px; }}
+.settings-tools {{ padding:14px 20px; border-bottom:1px solid var(--settings-line); }}
+.settings-search {{ width:100%; padding:11px 12px; border-radius:10px; border:1px solid var(--control-border); background:var(--input-bg); color:var(--strong-text); }}
+.settings-hint {{ color:var(--muted-2); font-size:12px; margin-top:8px; }}
 .baseline-warning {{
     margin-top:9px;
     padding:9px 11px;
-    border:1px solid #7d3b45;
+    border:1px solid var(--baseline-warning-border);
     border-radius:9px;
-    background:#2a171b;
-    color:#ff9da8;
+    background:var(--baseline-warning-bg);
+    color:var(--baseline-warning-text);
     font-size:12px;
     font-weight:700;
     line-height:1.45;
 }}
 .settings-layout {{ display:grid; grid-template-columns:220px 1fr; min-height:460px; overflow:hidden; flex:0 0 auto; }}
-.country-tabs {{ padding:10px; border-right:1px solid #27344a; overflow:auto; background:#0c1420; }}
-.country-tab {{ width:100%; display:flex; justify-content:space-between; gap:8px; border:0; background:transparent; color:#aebbd0; padding:10px 11px; border-radius:9px; cursor:pointer; text-align:left; }}
+.country-tabs {{ padding:10px; border-right:1px solid var(--settings-line); overflow:auto; background:var(--settings-alt); }}
+.country-tab {{ width:100%; display:flex; justify-content:space-between; gap:8px; border:0; background:transparent; color:var(--country-tab-text); padding:10px 11px; border-radius:9px; cursor:pointer; text-align:left; }}
 .country-tab span {{ opacity:.6; }}
-.country-tab.active {{ background:#1d2b43; color:#fff; }}
+.country-tab.active {{ background:var(--active-tab-bg); color:var(--active-tab-text); }}
 .country-tab.monitored {{
-    background:#132a22;
-    color:#a8e8cf;
-    box-shadow:inset 0 0 0 1px #39765f;
+    background:var(--good-panel-muted);
+    color:var(--good-text);
+    box-shadow:inset 0 0 0 1px var(--good-border);
 }}
 .country-tab.monitored span {{
-    color:#a8e8cf;
+    color:var(--good-text);
     opacity:.9;
 }}
 .country-tab.monitored.active {{
-    background:#1b3b2f;
-    color:#d8f7e9;
-    box-shadow:inset 0 0 0 1px #4c9b7a;
+    background:var(--good-panel-active);
+    color:var(--good-text-strong);
+    box-shadow:inset 0 0 0 1px var(--good-border-strong);
 }}
 .country-content {{ overflow:auto; padding:16px 18px 22px; }}
 .country-panel {{ display:none; }}
 .country-panel.active {{ display:block; }}
-.country-enable {{ margin-bottom:14px; padding:12px 14px; background:#151f30; border:1px solid #2d3b53; border-radius:10px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
-.baseline-reset-btn {{ border:1px solid #7a5a2f; background:#2a2115; color:#f1c981; border-radius:8px; padding:7px 10px; font-size:12px; font-weight:700; cursor:pointer; }}
-.baseline-reset-btn:hover {{ background:#382a18; }}
+.country-enable {{ margin-bottom:14px; padding:12px 14px; background:var(--country-enable-bg); border:1px solid var(--country-enable-border); border-radius:10px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }}
+.baseline-reset-btn {{ border:1px solid var(--baseline-reset-border); background:var(--baseline-reset-bg); color:var(--baseline-reset-text); border-radius:8px; padding:7px 10px; font-size:12px; font-weight:700; cursor:pointer; }}
+.baseline-reset-btn:hover {{ background:var(--baseline-reset-hover); }}
 .category-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
-.category-column {{ min-width:0; border:1px solid #293850; border-radius:12px; overflow:hidden; }}
-.category-column-head {{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:11px 12px; background:#131e2e; }}
+.category-column {{ min-width:0; border:1px solid var(--category-border); border-radius:12px; overflow:hidden; }}
+.category-column-head {{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:11px 12px; background:var(--category-head-bg); }}
 .category-column-head span {{ display:flex; gap:5px; }}
-.mini-select {{ border:1px solid #354761; background:#1a2639; color:#cad5e5; border-radius:7px; padding:4px 7px; font-size:11px; cursor:pointer; }}
+.mini-select {{ border:1px solid var(--mini-border); background:var(--mini-bg); color:var(--mini-text); border-radius:7px; padding:4px 7px; font-size:11px; cursor:pointer; }}
 .category-list {{ max-height:360px; overflow:auto; padding:8px; }}
 .category-option {{ display:flex; gap:8px; align-items:flex-start; padding:7px 8px; border-radius:7px; cursor:pointer; font-size:13px; }}
-.category-option:hover {{ background:#172337; }}
+.category-option:hover {{ background:var(--category-hover-bg); }}
 .category-option input {{ margin-top:2px; }}
-.settings-empty {{ color:#8fa2bd; padding:20px; }}
+.settings-empty {{ color:var(--muted-2); padding:20px; }}
 .settings-empty.small {{ padding:10px; font-size:12px; }}
-.modal-actions {{ display:flex; justify-content:flex-end; gap:9px; padding:14px 20px; border-top:1px solid #27344a; background:#0c1420; position:sticky; bottom:0; z-index:20; flex-shrink:0; }}
+.modal-actions {{ display:flex; justify-content:flex-end; gap:9px; padding:14px 20px; border-top:1px solid var(--settings-line); background:var(--settings-alt); position:sticky; bottom:0; z-index:20; flex-shrink:0; }}
 .secondary-btn,.save-btn {{ border-radius:9px; padding:10px 14px; font-weight:700; cursor:pointer; }}
-.secondary-btn {{ border:1px solid #34445e; background:#172235; color:#d9e2ef; }}
-.save-btn {{ border:1px solid #4d78ff; background:#2e5ee8; color:#fff; }}
-.scan-settings {{ padding:16px 20px; border-top:1px solid #27344a; background:#111d2c; }}
+.secondary-btn {{ border:1px solid var(--control-border); background:var(--secondary-bg); color:var(--secondary-text); }}
+.save-btn {{ border:1px solid var(--primary-border); background:var(--primary-bg); color:var(--primary-text); }}
+.scan-settings {{ padding:16px 20px; border-top:1px solid var(--settings-line); background:var(--settings-section); }}
 .scan-settings-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap; }}
 .scan-settings-head h3 {{ margin:2px 0 0; font-size:17px; }}
-.scan-now-btn {{ border:1px solid #3e6fa8; background:#172d47; color:#b9dcff; border-radius:9px; padding:8px 11px; font-weight:750; cursor:pointer; }}
-.scan-now-btn:hover {{ background:#203d5f; }}
+.scan-now-btn {{ border:1px solid var(--info-border); background:var(--info-bg); color:var(--info-text); border-radius:9px; padding:8px 11px; font-weight:750; cursor:pointer; }}
+.scan-now-btn:hover {{ background:var(--info-hover); }}
 .scan-now-btn:disabled {{ opacity:.65; cursor:default; }}
 .scan-grid {{ display:grid; grid-template-columns:1.4fr 1fr; gap:10px; align-items:end; }}
-.scan-grid label {{ display:flex; flex-direction:column; gap:6px; color:#9cafc7; font-size:12px; }}
-.scan-grid select,.scan-grid input[type="number"] {{ width:100%; border:1px solid #34445e; background:#111b2b; color:#fff; border-radius:9px; padding:9px 10px; }}
+.scan-grid label {{ display:flex; flex-direction:column; gap:6px; color:var(--label); font-size:12px; }}
+.scan-grid select,.scan-grid input[type="number"] {{ width:100%; border:1px solid var(--control-border); background:var(--input-bg); color:var(--strong-text); border-radius:9px; padding:9px 10px; }}
 .scan-custom-hidden {{ display:none !important; }}
 .scan-custom-visible {{ display:flex !important; }}
-.scan-info {{ color:#8295b0; font-size:11px; margin-top:10px; line-height:1.5; }}
-.scan-info strong {{ color:#cbd7e6; }}
-.backup-settings {{ padding:16px 20px; border-top:1px solid #27344a; background:#101a28; }}
+.scan-info {{ color:var(--muted-3); font-size:11px; margin-top:10px; line-height:1.5; }}
+.scan-info strong {{ color:var(--info-strong); }}
+.backup-settings {{ padding:16px 20px; border-top:1px solid var(--settings-line); background:var(--settings-section-2); }}
 .backup-settings-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap; }}
 .backup-settings-head h3 {{ margin:2px 0 0; font-size:17px; }}
-.backup-now-btn {{ border:1px solid #39765f; background:#173429; color:#a8e8cf; border-radius:9px; padding:8px 11px; font-weight:750; cursor:pointer; }}
-.backup-now-btn:hover {{ background:#204537; }}
+.backup-now-btn {{ border:1px solid var(--good-border); background:var(--good-panel); color:var(--good-text); border-radius:9px; padding:8px 11px; font-weight:750; cursor:pointer; }}
+.backup-now-btn:hover {{ background:var(--good-hover); }}
 .backup-grid {{ display:grid; grid-template-columns:1.4fr 1fr .8fr 1fr; gap:10px; align-items:end; }}
-.backup-grid label {{ display:flex; flex-direction:column; gap:6px; color:#9cafc7; font-size:12px; }}
-.backup-grid select,.backup-grid input[type="time"],.backup-grid input[type="number"] {{ width:100%; border:1px solid #34445e; background:#111b2b; color:#fff; border-radius:9px; padding:9px 10px; }}
-.backup-toggle {{ flex-direction:row !important; align-items:center; gap:9px !important; min-height:39px; padding:9px 10px; border:1px solid #2c3b53; border-radius:9px; background:#111b2b; color:#dce5f1 !important; }}
+.backup-grid label {{ display:flex; flex-direction:column; gap:6px; color:var(--label); font-size:12px; }}
+.backup-grid select,.backup-grid input[type="time"],.backup-grid input[type="number"] {{ width:100%; border:1px solid var(--control-border); background:var(--input-bg); color:var(--strong-text); border-radius:9px; padding:9px 10px; }}
+.backup-toggle {{ flex-direction:row !important; align-items:center; gap:9px !important; min-height:39px; padding:9px 10px; border:1px solid var(--control-border-soft); border-radius:9px; background:var(--input-bg); color:var(--toggle-text) !important; }}
 .backup-keep {{ display:flex; align-items:center; gap:7px; }}
 .backup-keep span {{ white-space:nowrap; }}
-.backup-info {{ color:#8295b0; font-size:11px; margin-top:10px; line-height:1.5; }}
-.backup-info strong {{ color:#cbd7e6; }}
-.email-settings {{ padding:16px 20px; border-top:1px solid #27344a; background:#111b29; }}
+.backup-info {{ color:var(--muted-3); font-size:11px; margin-top:10px; line-height:1.5; }}
+.backup-info strong {{ color:var(--info-strong); }}
+.email-settings {{ padding:16px 20px; border-top:1px solid var(--settings-line); background:var(--settings-section-3); }}
 .email-settings-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; flex-wrap:wrap; }}
 .email-settings-head h3 {{ margin:2px 0 0; font-size:17px; }}
-.email-test-btn {{ border:1px solid #4c6488; background:#18263b; color:#d7e5fa; border-radius:9px; padding:8px 11px; font-weight:750; cursor:pointer; }}
-.email-test-btn:hover {{ background:#22344f; }}
+.email-test-btn {{ border:1px solid var(--email-test-border); background:var(--email-test-bg); color:var(--email-test-text); border-radius:9px; padding:8px 11px; font-weight:750; cursor:pointer; }}
+.email-test-btn:hover {{ background:var(--email-test-hover); }}
 .email-grid {{ display:grid; grid-template-columns:1.25fr 1.25fr .55fr .85fr; gap:10px; align-items:end; }}
-.email-grid label {{ display:flex; flex-direction:column; gap:6px; color:#9cafc7; font-size:12px; }}
-.email-grid input,.email-grid select {{ width:100%; border:1px solid #34445e; background:#111b2b; color:#fff; border-radius:9px; padding:9px 10px; box-sizing:border-box; }}
-.email-toggle {{ flex-direction:row !important; align-items:center; gap:9px !important; min-height:39px; padding:9px 10px; border:1px solid #2c3b53; border-radius:9px; background:#111b2b; color:#dce5f1 !important; }}
+.email-grid label {{ display:flex; flex-direction:column; gap:6px; color:var(--label); font-size:12px; }}
+.email-grid input,.email-grid select {{ width:100%; border:1px solid var(--control-border); background:var(--input-bg); color:var(--strong-text); border-radius:9px; padding:9px 10px; box-sizing:border-box; }}
+.email-toggle {{ flex-direction:row !important; align-items:center; gap:9px !important; min-height:39px; padding:9px 10px; border:1px solid var(--control-border-soft); border-radius:9px; background:var(--input-bg); color:var(--toggle-text) !important; }}
 .email-toggle input {{ width:auto !important; }}
-.email-events {{ display:flex; gap:10px 16px; flex-wrap:wrap; margin-top:12px; padding:10px 12px; border:1px solid #2c3b53; border-radius:9px; background:#101a28; color:#c9d6e7; font-size:12px; }}
-.email-events > span {{ color:#8fa2bd; font-weight:700; width:100%; }}
+.email-events {{ display:flex; gap:10px 16px; flex-wrap:wrap; margin-top:12px; padding:10px 12px; border:1px solid var(--control-border-soft); border-radius:9px; background:var(--settings-section-2); color:var(--email-events-text); font-size:12px; }}
+.email-events > span {{ color:var(--muted-2); font-weight:700; width:100%; }}
 .email-events label {{ display:flex; align-items:center; gap:6px; }}
-.email-info {{ color:#8295b0; font-size:11px; margin-top:10px; line-height:1.5; }}
+.email-info {{ color:var(--muted-3); font-size:11px; margin-top:10px; line-height:1.5; }}
 @media (max-width: 1050px) {{ .email-grid {{ grid-template-columns:1fr 1fr; }} }}
 @media (max-width: 900px) {{ .backup-grid {{ grid-template-columns:1fr 1fr; }} .scan-grid {{ grid-template-columns:1fr 1fr; }} }}
 @media (max-width: 760px) {{
   .settings-layout {{ grid-template-columns:1fr; min-height:520px; }}
-  .country-tabs {{ display:flex; gap:6px; border-right:0; border-bottom:1px solid #27344a; overflow:auto; }}
+  .country-tabs {{ display:flex; gap:6px; border-right:0; border-bottom:1px solid var(--settings-line); overflow:auto; }}
   .country-tab {{ width:auto; min-width:max-content; }}
   .category-grid {{ grid-template-columns:1fr; }}
   .backup-grid {{ grid-template-columns:1fr; }}
   .scan-grid {{ grid-template-columns:1fr; }}
   .email-grid {{ grid-template-columns:1fr; }}
+}}
+.theme-switch {{
+    cursor: pointer;
+}}
+
+.theme-switch:hover {{
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}}
+
+:root[data-theme="light"] {{
+    color-scheme: light;
+
+    --bg: #eef2f7;
+    --bg-glow: rgba(111,80,232,.08);
+    --panel: #ffffff;
+    --panel-2: #f6f8fb;
+
+    --line: #d6dee9;
+    --line-strong: #c7d2df;
+    --line-medium: #d2dae5;
+    --modal-border: #cbd5e1;
+    --settings-line: #d9e1eb;
+    --control-border: #cbd5e1;
+    --control-border-soft: #d6dee9;
+    --category-border: #d7e0ea;
+    --country-enable-border: #d7e0ea;
+    --country-enable-bg: #ffffff;
+    --category-head-bg: #f6f8fb;
+    --mini-border: #cbd5e1;
+    --mini-bg: #ffffff;
+    --category-hover-bg: #eef3f9;
+
+    --text: #172033;
+    --text-soft: #44536a;
+    --text-bright: #172033;
+    --strong-text: #172033;
+    --muted: #68758a;
+    --muted-2: #718096;
+    --muted-3: #718096;
+    --label: #64748b;
+
+    --accent: #6f50e8;
+    --accent-soft: rgba(111,80,232,.10);
+
+    --good: #16845f;
+    --good-soft: rgba(22,132,95,.10);
+    --good-border: #8dcbb2;
+    --good-border-strong: #72b99d;
+    --good-panel: #eef9f4;
+    --good-panel-muted: #eef9f4;
+    --good-panel-active: #e1f5eb;
+    --good-text: #176a4c;
+    --good-text-soft: #176a4c;
+    --good-text-strong: #115b41;
+    --good-hover: #d9f2e6;
+
+    --warn: #ad6812;
+    --warn-soft: rgba(173,104,18,.10);
+    --warn-border: rgba(173,104,18,.28);
+    --warn-text: #8c5a0b;
+
+    --danger: #c13c4a;
+    --danger-soft: rgba(193,60,74,.10);
+    --danger-border: #e6a8ae;
+    --danger-panel: #fff1f2;
+    --danger-text: #a62f3b;
+
+    --hero-bg: linear-gradient(180deg, #ffffff 0%, #f5f7fb 100%);
+    --toolbar-bg: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+    --card-bg: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+    --section-bg: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+
+    --glass-bg: rgba(255,255,255,.72);
+    --day-bg: rgba(15,23,42,.018);
+    --hover-bg-strong: rgba(15,23,42,.05);
+    --code-bg: #eef2f7;
+    --hairline: rgba(15,23,42,.08);
+    --hairline-strong: rgba(15,23,42,.10);
+
+    --shadow-card: 0 12px 32px rgba(15,23,42,.08);
+    --shadow-stat: 0 12px 30px rgba(15,23,42,.08);
+    --shadow-strong: 0 16px 42px rgba(15,23,42,.10);
+    --shadow-inset: inset 0 1px 0 rgba(255,255,255,.82);
+    --shadow-inset-soft: inset 0 1px 0 rgba(255,255,255,.72);
+    --toast-shadow: 0 12px 35px rgba(15,23,42,.14);
+    --modal-shadow: 0 24px 80px rgba(15,23,42,.18);
+
+    --overlay: rgba(15,23,42,.28);
+    --settings-bg: #ffffff;
+    --settings-alt: #f6f8fb;
+    --settings-section: #f7f9fc;
+    --settings-section-2: #f8fafc;
+    --settings-section-3: #f8fafc;
+
+    --button-bg: #ffffff;
+    --button-hover: #f1f5f9;
+    --button-text: #172033;
+    --secondary-bg: #ffffff;
+    --secondary-text: #172033;
+    --input-bg: #ffffff;
+    --toggle-text: #172033;
+    --active-tab-bg: #ece8ff;
+    --active-tab-text: #4d38c8;
+
+    --baseline-warning-border: #efb4ba;
+    --baseline-warning-bg: #fff1f2;
+    --baseline-warning-text: #a62f3b;
+    --baseline-reset-border: #e0ba7c;
+    --baseline-reset-bg: #fff8e8;
+    --baseline-reset-text: #8a5a10;
+    --baseline-reset-hover: #fff1cf;
+
+    --primary-border: #6f50e8;
+    --primary-bg: #6f50e8;
+    --primary-text: #ffffff;
+
+    --info-border: #9fc0ef;
+    --info-bg: #e8f1ff;
+    --info-text: #204a87;
+    --info-hover: #dceaff;
+
+    --email-test-border: #b5c4dd;
+    --email-test-bg: #eef3fb;
+    --email-test-text: #334e75;
+    --email-test-hover: #e2eaf6;
+
+    --country-tab-text: #5f6f86;
+    --mini-text: #44536a;
+    --info-strong: #44536a;
+    --email-events-text: #44536a;
 }}
 
 </style>
@@ -5283,6 +5538,15 @@ code {{
                     <option value="en"{" selected" if lang == "en" else ""}>GB</option>
                 </select>
             </form>
+
+            <button type="button"
+                    class="theme-switch"
+                    id="themeSwitch"
+                    title="{L("Changer de thème", "Change theme")}"
+                    aria-label="{L("Changer de thème", "Change theme")}">
+                <span id="themeSwitchIcon" aria-hidden="true">☀️</span>
+                <span id="themeSwitchText">{L("Clair", "Light")}</span>
+            </button>
         </div>
     </div>
 
@@ -5305,6 +5569,46 @@ code {{
         </div>
     </div>
 </header>
+<script>
+(() => {{
+    const root = document.documentElement;
+    const button = document.getElementById("themeSwitch");
+    const icon = document.getElementById("themeSwitchIcon");
+    const text = document.getElementById("themeSwitchText");
+
+    if (!button || !icon || !text) return;
+
+    const lightLabel = "{L("Clair", "Light")}";
+    const darkLabel = "{L("Sombre", "Dark")}";
+
+    function updateThemeButton() {{
+        const current = root.getAttribute("data-theme") === "light" ? "light" : "dark";
+
+        if (current === "light") {{
+            icon.textContent = "🌙";
+            text.textContent = darkLabel;
+        }} else {{
+            icon.textContent = "☀️";
+            text.textContent = lightLabel;
+        }}
+    }}
+
+    button.addEventListener("click", () => {{
+        const current = root.getAttribute("data-theme") === "light" ? "light" : "dark";
+        const next = current === "light" ? "dark" : "light";
+
+        root.setAttribute("data-theme", next);
+
+        try {{
+            localStorage.setItem("xtream-theme", next);
+        }} catch (_) {{}}
+
+        updateThemeButton();
+    }});
+
+    updateThemeButton();
+}})();
+</script>
 
 <nav class="toolbar">
     <div class="toolbar-main">
