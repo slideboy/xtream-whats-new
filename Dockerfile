@@ -9,6 +9,7 @@ RUN apk add --no-cache tzdata
 
 WORKDIR /app
 COPY watcher.py /app/watcher.py
+COPY assets /app/assets
 COPY data/config.json /app/config.default.json
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

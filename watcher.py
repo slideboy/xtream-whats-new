@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import html
 
 BASE = Path("/data")
+ASSET_DIR = Path("/app/assets")
 CONFIG_PATH = BASE / "config.json"
 DB_PATH = BASE / "nouveautes.sqlite3"
 BACKUP_DIR = BASE / "backups"
@@ -36,7 +37,7 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "Xtream What's New"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 APP_USER_AGENT = f"Mozilla/5.0 Xtream-Whats-New/{APP_VERSION}"
 
 def utc_now():
@@ -1686,19 +1687,19 @@ def build_email_digest(events, settings, period_start=None, period_end=None):
     movies = [e for e in selected if e["kind"] == "movie"]
     if movies:
         detail_lines.extend(["", ui_text(lang, "FILMS", "MOVIES")])
-        detail_lines.extend(f"• {safe_text(e['title'])}" for e in movies)
+        detail_lines.extend(f"• {clean_display_title(e['title'])}" for e in movies)
 
     series = [e for e in selected if e["kind"] == "series"]
     if series:
         detail_lines.extend(["", ui_text(lang, "SÉRIES", "SERIES")])
-        detail_lines.extend(f"• {safe_text(e['title'])}" for e in series)
+        detail_lines.extend(f"• {clean_display_title(e['title'])}" for e in series)
 
     episodes = [e for e in selected if e["kind"] == "episode"]
     if episodes:
         detail_lines.extend(["", ui_text(lang, "ÉPISODES", "EPISODES")])
         groups = {}
         for e in episodes:
-            groups.setdefault(safe_text(e["title"]), []).append(e)
+            groups.setdefault(clean_display_title(e["title"]), []).append(e)
         for title, items in groups.items():
             detail_lines.append(_episode_summary(title, items, lang))
 
@@ -4538,6 +4539,8 @@ def render_page(days):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(APP_NAME)}</title>
+<link rel="icon" type="image/png" sizes="64x64" href="/favicon.png?v={html.escape(APP_VERSION)}">
+<link rel="apple-touch-icon" href="/app-logo.png?v={html.escape(APP_VERSION)}">
 <script>
 (() => {{
     try {{
@@ -4714,6 +4717,21 @@ h1 {{
     margin: 4px 0 6px;
     font-size: clamp(25px, 5vw, 36px);
     letter-spacing: -.035em;
+}}
+
+.app-title {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}}
+.app-logo {{
+    width: clamp(36px, 5vw, 42px);
+    height: clamp(36px, 5vw, 42px);
+    display: block;
+    flex: 0 0 auto;
+    border-radius: 11px;
+    box-shadow: 0 5px 16px rgba(0,0,0,.25);
 }}
 .version-badge {{
     display: inline-flex;
@@ -5503,7 +5521,7 @@ code {{
     <div class="hero-top">
         <div>
             <div class="eyebrow">Monitoring Xtream · <span id="monitorCountryDisplay">{html.escape(country_display)}</span></div>
-            <h1>📡 {html.escape(APP_NAME)} <span class="version-badge">v{html.escape(APP_VERSION)}</span></h1>
+            <h1 class="app-title"><img class="app-logo" src="/app-logo.png?v={html.escape(APP_VERSION)}" alt="" aria-hidden="true"><span>{html.escape(APP_NAME)}</span><span class="version-badge">v{html.escape(APP_VERSION)}</span></h1>
             <div class="hero-sub">{total_changes} {L("changement(s) sur la période sélectionnée", "change(s) in the selected period")}</div>
         </div>
         <div class="hero-actions">
@@ -6448,6 +6466,26 @@ document.querySelectorAll('.mini-select').forEach(btn => {{
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if parsed.path in ("/favicon.png", "/app-logo.png"):
+            asset_name = {
+                "/favicon.png": "favicon.png",
+                "/app-logo.png": "app-logo.png",
+            }[parsed.path]
+            asset_path = ASSET_DIR / asset_name
+            try:
+                body = asset_path.read_bytes()
+            except OSError:
+                self.send_error(404)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if parsed.path == "/api/scan/status":
             payload = json.dumps(get_scan_status(), ensure_ascii=False).encode("utf-8")
