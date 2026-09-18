@@ -37,7 +37,7 @@ EMAIL_CHECK_SECONDS = 15
 EMAIL_RETRY_MINUTES = 10
 
 APP_NAME = "Xtream What's New"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 APP_USER_AGENT = f"Mozilla/5.0 Xtream-Whats-New/{APP_VERSION}"
 
 def utc_now():
@@ -3247,6 +3247,28 @@ def process_pending_series(conn, scan_errors=None, monitored_categories=None):
             """, (sid,)).fetchall()
             old_ids = {r["episode_id"] for r in old_rows}
 
+            # Pour une nouvelle série, mémoriser son contenu initial dans
+            # l'événement "series" sans créer de faux événements épisodes.
+            if int(s["is_new"]) and current_eps:
+                season_numbers = sorted({
+                    int(e["season"])
+                    for e in current_eps
+                    if int(e.get("season") or 0) > 0
+                })
+                episode_total = len(current_eps)
+
+                if season_numbers:
+                    season_csv = ",".join(str(x) for x in season_numbers)
+                    initial_summary = f"__series_initial__:{season_csv}:{episode_total}"
+                    conn.execute("""
+                        UPDATE events
+                        SET subtitle=?
+                        WHERE event_key=? AND kind='series'
+                    """, (
+                        initial_summary,
+                        f"series:{sid}",
+                    ))
+
             # Nouveaux épisodes
             if not int(s["is_new"]):
                 if old_ids:
@@ -4299,8 +4321,51 @@ def render_page(days):
                 grouped_events = episode_groups.get(key, [e])
                 episode_count = len(grouped_events)
                 episode_word = L("épisode", "episode") if episode_count == 1 else L("épisodes", "episodes")
+
+                episode_codes = sorted({
+                    code
+                    for code in (_episode_code(x) for x in grouped_events)
+                    if code
+                })
+
+                episodes_by_season = {}
+                for season_num, episode_num in episode_codes:
+                    episodes_by_season.setdefault(season_num, []).append(episode_num)
+
+                episode_detail_text = ""
+                episode_detail_parts = []
+
+                for season_num in sorted(episodes_by_season):
+                    episode_nums = sorted(set(episodes_by_season[season_num]))
+
+                    if len(episode_nums) == 1:
+                        episode_text = f'{L("Épisode", "Episode")} {episode_nums[0]}'
+                    elif episode_nums == list(range(episode_nums[0], episode_nums[-1] + 1)):
+                        episode_text = (
+                            f'{L("Épisodes", "Episodes")} '
+                            f'{episode_nums[0]} {L("à", "to")} {episode_nums[-1]}'
+                        )
+                    else:
+                        episode_text = (
+                            f'{L("Épisodes", "Episodes")} '
+                            + ", ".join(str(x) for x in episode_nums)
+                        )
+
+                    episode_detail_parts.append(
+                        f'{L("Saison", "Season")} {season_num} · {episode_text}'
+                    )
+
+                episode_detail_text = " / ".join(episode_detail_parts)
+
                 title = html.escape(clean_display_title(e["title"] or ""))
-                cat = html.escape(e["category"] or "")
+                raw_cat = safe_text(e["category"])
+                display_cat = re.sub(
+                    r'^\s*(?:[|\[({<]\s*[A-Z]{2,3}\s*[|\])}>]|[A-Z]{2,3}\s*[-:|/•·])\s*',
+                    '',
+                    raw_cat,
+                    flags=re.IGNORECASE
+                )
+                cat = html.escape(display_cat)
                 detected = html.escape(fmt_dt(e["detected_at"]))
                 searchable = html.escape(
                     " ".join([
@@ -4311,9 +4376,12 @@ def render_page(days):
                     ]).lower(),
                     quote=True
                 )
-                meta_bits = [detected]
+                meta_bits = []
+                if episode_detail_text:
+                    meta_bits.append(f'<span class="event-season">{html.escape(episode_detail_text)}</span>')
+                meta_bits.append(detected)
                 if cat:
-                    meta_bits.append(cat)
+                    meta_bits.append(f'<span class="event-category">{cat}</span>')
                 card = (
                     f'<article class="event-card" data-filter="episode" data-event-count="{episode_count}" data-search="{searchable}">'
                     f'<div class="event-icon">▶️</div>'
@@ -4337,15 +4405,65 @@ def render_page(days):
             filter_kind, emoji = kind_labels.get(kind, ("autre", "ℹ️"))
             title = html.escape(clean_display_title(e["title"] or ""))
             raw_subtitle = safe_text(e["subtitle"])
+            series_initial_summary = False
+
+            if kind == "series" and raw_subtitle.startswith("__series_initial__:"):
+                series_initial_summary = True
+                try:
+                    _, season_csv, episode_total_raw = raw_subtitle.split(":", 2)
+                    season_numbers = sorted({
+                        int(x)
+                        for x in season_csv.split(",")
+                        if x.strip()
+                    })
+                    episode_total = int(episode_total_raw)
+
+                    if len(season_numbers) == 1:
+                        season_label = f'{L("Saison", "Season")} {season_numbers[0]}'
+                    elif (
+                        season_numbers
+                        and season_numbers
+                        == list(range(season_numbers[0], season_numbers[-1] + 1))
+                    ):
+                        season_label = (
+                            f'{L("Saisons", "Seasons")} '
+                            f'{season_numbers[0]} {L("à", "to")} {season_numbers[-1]}'
+                        )
+                    else:
+                        season_label = (
+                            f'{L("Saisons", "Seasons")} '
+                            + ", ".join(str(x) for x in season_numbers)
+                        )
+
+                    episode_label = (
+                        L("épisode", "episode")
+                        if episode_total == 1
+                        else L("épisodes", "episodes")
+                    )
+
+                    raw_subtitle = (
+                        f"{season_label} · {episode_total} {episode_label}"
+                    )
+                except (ValueError, TypeError):
+                    pass
+
             if lang == "en" and raw_subtitle in generated_subtitle_en:
                 raw_subtitle = generated_subtitle_en[raw_subtitle]
+
             subtitle = html.escape(raw_subtitle)
-            cat = html.escape(e["category"] or "")
+            raw_cat = safe_text(e["category"])
+            display_cat = re.sub(
+                r'^\s*(?:[|\[({<]\s*[A-Z]{2,3}\s*[|\])}>]|[A-Z]{2,3}\s*[-:|/•·])\s*',
+                '',
+                raw_cat,
+                flags=re.IGNORECASE
+            )
+            cat = html.escape(display_cat)
             detected = html.escape(fmt_dt(e["detected_at"]))
             searchable = html.escape(
                 " ".join([
                     safe_text(e["title"]),
-                    safe_text(e["subtitle"]),
+                    raw_subtitle,
                     safe_text(e["category"]),
                     kind,
                 ]).lower(),
@@ -4360,16 +4478,19 @@ def render_page(days):
             elif "removed" in kind:
                 badge = f'<span class="event-badge remove">{L("Supprimé", "Removed")}</span>'
 
-            meta_bits = [detected]
+            meta_bits = []
+            if series_initial_summary and subtitle:
+                meta_bits.append(f'<span class="event-season">{subtitle}</span>')
+            meta_bits.append(detected)
             if cat and "category" not in kind:
-                meta_bits.append(cat)
+                meta_bits.append(f'<span class="event-category">{cat}</span>')
 
             card = (
                 f'<article class="event-card" data-filter="{filter_kind}" data-event-count="1" data-search="{searchable}">'
                 f'<div class="event-icon">{emoji}</div>'
                 f'<div class="event-main">'
                 f'<div class="event-title-row"><div class="event-title">{title}</div>{badge}</div>'
-                f'{"<div class=\"event-subtitle\">"+subtitle+"</div>" if subtitle else ""}'
+                f'{"<div class=\"event-subtitle\">"+subtitle+"</div>" if subtitle and not series_initial_summary else ""}'
                 f'<div class="event-meta">{" · ".join(meta_bits)}</div>'
                 f'</div>'
                 f'</article>'
@@ -4472,7 +4593,7 @@ def render_page(days):
 
     def watcher_errors_section():
         if not watcher_errors:
-            body = f'<div class="empty-state">{L("Aucune erreur sur le dernier scan.", "No error on the latest scan.")}</div>'
+            return ""
         else:
             rows = []
             for item in reversed(watcher_errors):
@@ -5138,6 +5259,22 @@ h1 {{
     font-size: 11px;
     margin-top: 5px;
 }}
+.event-season {{
+    color: var(--text);
+    font-weight: 800;
+}}
+.event-category {{
+    display: inline-block;
+    color: var(--text);
+    background: var(--button-bg);
+    border: 1px solid var(--modal-border);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: .02em;
+    line-height: 1.25;
+}}
 .event-badge {{
     flex: 0 0 auto;
     border-radius: 999px;
@@ -5582,7 +5719,7 @@ code {{
             <div class="quick-value">{html.escape(duration)} s</div>
         </div>
         <div class="quick">
-            <div class="quick-label">{L("Dernière mise à jour", "Last update")}</div>
+            <div class="quick-label">{L("Dernière nouveauté détectée", "Latest detected change")}</div>
             <div class="quick-value">{html.escape(last_update)}</div>
         </div>
     </div>
